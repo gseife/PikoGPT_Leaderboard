@@ -12,113 +12,38 @@ from pathlib import Path
 
 
 def _ensure_venv_python() -> None:
-    """Re-exec under a Python that has torch+transformers if the spawning
-    interpreter is missing either of them.
-
-    The leaderboard runner (`leaderboard/run_benchmarks.py`) spawns each
-    inference call via `subprocess.run([python_exe, main_path, ...])` with
-    `python_exe` defaulting to the literal string "python". On the TA's
-    machine that can resolve through PATH to a system interpreter without
-    torch (or without transformers), even when the runner itself was
-    launched with `uv run`. The result is that every subprocess dies on
-    `import torch` / `import transformers` and the harness counts each
-    example as invalid.
-
-    Probe order before re-exec:
-      1. `VIRTUAL_ENV` — set by `uv run` and by activated venvs; the most
-         reliable pointer at the parent's actual interpreter.
-      2. `UV_PROJECT_ENVIRONMENT` — uv's per-project venv override.
-      3. Walk up from the submission directory for `.venv/`, `venv/`, or
-         `env/` directories with a `bin/python` (POSIX) or
-         `Scripts\\python.exe` (Windows).
-
-    `_PARROTLABS_BOOTSTRAPPED=1` blocks an infinite re-exec loop if the
-    candidate interpreter also lacks the deps. A diagnostic line is
-    written to stderr (NOT stdout — the leaderboard contract requires
-    a clean stdout) so the TA can see when the shim fires.
+    """If the runner spawned us with a python that doesn't have our deps,
+    re-exec under the leaderboard repo's `.venv` python. The leaderboard
+    runner uses `--python` defaulting to literal "python", which on
+    Windows can resolve to a system interpreter without torch even under
+    `uv run`. This shim makes the submission work regardless.
     """
     if os.environ.get("_PARROTLABS_BOOTSTRAPPED") == "1":
         return
-    probe_error: BaseException | None = None
     try:
         import torch  # noqa: F401
-        import transformers  # noqa: F401
-        # Probe our own modules too -- catches PEP-604 / PEP-585 syntax
-        # failures on Python <3.10 even if torch+transformers are present.
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from src.model.transformer import ParrotLLM  # noqa: F401
-        from src.inference import detect_mc_prompt  # noqa: F401
         return
-    except Exception as exc:  # ImportError, TypeError, SyntaxError, etc.
-        probe_error = exc
-
-    # IMPORTANT: do NOT compare via Path.resolve() — uv venvs share the same
-    # underlying interpreter binary, so two different venvs with different
-    # site-packages resolve to the same path. The right notion of "same as
-    # me" is the venv directory containing the python, not the binary it
-    # ultimately symlinks to.
-    cur_path = Path(sys.executable).absolute()
-    cur_venv_dir = cur_path.parent.parent  # e.g., /path/to/.venv
-
-    candidates: list[Path] = []
-
-    for env_key in ("VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"):
-        env_val = os.environ.get(env_key)
-        if env_val:
-            for sub in (
-                Path("bin") / "python",
-                Path("bin") / "python3",
-                Path("Scripts") / "python.exe",
-            ):
-                candidates.append(Path(env_val) / sub)
-
+    except ImportError:
+        pass
     here = Path(__file__).resolve().parent
-    venv_dirs = (".venv", "venv", "env")
-    interp_subs = (
-        Path("bin") / "python",
-        Path("bin") / "python3",
-        Path("Scripts") / "python.exe",
+    candidate_subs = (
+        Path(".venv") / "Scripts" / "python.exe",
+        Path(".venv") / "bin" / "python",
+        Path(".venv") / "bin" / "python3",
     )
+    cur = Path(sys.executable).resolve()
     for parent in [here, *here.parents]:
-        for vdir in venv_dirs:
-            for sub in interp_subs:
-                candidates.append(parent / vdir / sub)
-
-    seen_dirs: set[Path] = set()
-    chosen: Path | None = None
-    for cand in candidates:
-        if not cand.exists():
-            continue
-        cand_abs = cand.absolute()
-        cand_venv_dir = cand_abs.parent.parent
-        if cand_venv_dir == cur_venv_dir or cand_venv_dir in seen_dirs:
-            continue
-        seen_dirs.add(cand_venv_dir)
-        chosen = cand
-        break
-
-    if chosen is None:
-        sys.stderr.write(
-            f"[parrotlabs_parrotllm] no fallback venv found and current "
-            f"interpreter cannot import deps: {probe_error!r}. cwd={os.getcwd()} "
-            f"VIRTUAL_ENV={os.environ.get('VIRTUAL_ENV')!r}\n"
-        )
-        sys.stderr.flush()
-        return  # let the next import statement raise the real traceback
-
-    env = os.environ.copy()
-    env["_PARROTLABS_BOOTSTRAPPED"] = "1"
-    sys.stderr.write(
-        f"[parrotlabs_parrotllm] re-exec via {chosen} "
-        f"(probe failed: {probe_error!r})\n"
-    )
-    sys.stderr.flush()
-    import subprocess
-    rc = subprocess.run(
-        [str(chosen), str(Path(__file__).resolve()), *sys.argv[1:]],
-        env=env,
-    ).returncode
-    sys.exit(rc)
+        for sub in candidate_subs:
+            cand = parent / sub
+            if cand.exists() and cand.resolve() != cur:
+                env = os.environ.copy()
+                env["_PARROTLABS_BOOTSTRAPPED"] = "1"
+                import subprocess
+                rc = subprocess.run(
+                    [str(cand), str(Path(__file__).resolve()), *sys.argv[1:]],
+                    env=env,
+                ).returncode
+                sys.exit(rc)
 
 
 _ensure_venv_python()
