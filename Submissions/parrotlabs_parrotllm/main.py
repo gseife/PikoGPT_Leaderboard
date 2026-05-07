@@ -198,6 +198,29 @@ def load_tokenizer(submission_dir: Path) -> GPT2TokenizerFast:
 
 
 def load_checkpoint(checkpoint_path: Path, device: torch.device) -> dict:
+    # Python 3.13 moved PosixPath/WindowsPath into `pathlib._local`; 3.12
+    # and 3.14 keep them in `pathlib` directly. A checkpoint pickled on
+    # 3.13 references `pathlib._local.PosixPath`, which fails to unpickle
+    # on any other Python version with
+    # `ModuleNotFoundError: No module named 'pathlib._local'`.
+    #
+    # Aliasing the submodule with Pure* variants makes the unpickle work
+    # on all Python versions AND all OSes: PurePosixPath/PureWindowsPath
+    # only do path-string manipulation, no platform-specific I/O, so
+    # instantiating a "PosixPath" on Windows (or vice-versa) no longer
+    # raises NotImplementedError. The config blob only treats these as
+    # opaque path strings, so the Pure variants are functionally identical.
+    import pathlib as _pathlib
+    import types as _types
+    if "pathlib._local" not in sys.modules:
+        _local = _types.ModuleType("pathlib._local")
+        _local.PosixPath = _pathlib.PurePosixPath
+        _local.WindowsPath = _pathlib.PureWindowsPath
+        _local.PurePosixPath = _pathlib.PurePosixPath
+        _local.PureWindowsPath = _pathlib.PureWindowsPath
+        _local.PurePath = _pathlib.PurePath
+        _local.Path = _pathlib.PurePath
+        sys.modules["pathlib._local"] = _local
     try:
         return torch.load(checkpoint_path, map_location=device, weights_only=False)
     except TypeError:
